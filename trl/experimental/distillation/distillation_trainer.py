@@ -869,60 +869,69 @@ class DistillationTrainer(_BaseTrainer):
 
     def _generate_with_model(self, slices: list[dict[str, torch.Tensor | Any]], on_policy_indices: list[int]):
         """Fallback generation using model.generate() (no vLLM)."""
+        prompt_batches = [slices[slice_idx]["prompts"] for slice_idx in on_policy_indices]
+        slice_batch_sizes = [prompt_batch.shape[0] for prompt_batch in prompt_batches]
+        combined_inputs = {"prompts": torch.cat(prompt_batches, dim=0)}
+
+        prompt_mask_batches = [slices[slice_idx].get("prompt_attention_mask") for slice_idx in on_policy_indices]
+        if prompt_mask_batches[0] is not None:
+            combined_inputs["prompt_attention_mask"] = torch.cat(prompt_mask_batches, dim=0)
+
         with unwrap_model_for_generation(
             self.model, self.accelerator, generation_kwargs=self.generation_kwargs
         ) as unwrapped_model:
-            for slice_idx in on_policy_indices:
-                slice_inputs = slices[slice_idx]
-                generated_outputs = unwrapped_model.generate(
-                    input_ids=slice_inputs["prompts"],
-                    attention_mask=slice_inputs.get("prompt_attention_mask", None),
-                    generation_config=self.generation_config,
-                    return_dict_in_generate=True,
-                )
-                generated_tokens = generated_outputs.sequences
-                batch_size = generated_tokens.size(0)
-                device = generated_tokens.device
-                pad_token_id = self.processing_class.pad_token_id
-                prompt_width = slice_inputs["prompts"].shape[1]
-                prompt_mask = slice_inputs.get("prompt_attention_mask")
+            generated_outputs = unwrapped_model.generate(
+                input_ids=combined_inputs["prompts"],
+                attention_mask=combined_inputs.get("prompt_attention_mask", None),
+                generation_config=self.generation_config,
+                return_dict_in_generate=True,
+            )
+            generated_tokens = generated_outputs.sequences
+            batch_size = generated_tokens.size(0)
+            device = generated_tokens.device
+            pad_token_id = self.processing_class.pad_token_id
+            prompt_width = combined_inputs["prompts"].shape[1]
+            prompt_mask = combined_inputs.get("prompt_attention_mask")
+            if prompt_mask is not None:
+                prompt_token_lengths = prompt_mask.sum(dim=1)
+            else:
+                prompt_token_lengths = torch.full((batch_size,), prompt_width, dtype=torch.long, device=device)
+            completion_lengths = self._get_completion_lengths(generated_tokens, prompt_width)
+            new_attention_mask, new_labels = self._build_sequence_batch(
+                generated_tokens, prompt_width, prompt_token_lengths, completion_lengths
+            )
+
+            # Decode for logging.
+            prompt_texts = []
+            completion_texts = []
+            for idx in range(batch_size):
+                prompt_tokens = combined_inputs["prompts"][idx]
                 if prompt_mask is not None:
-                    prompt_token_lengths = prompt_mask.sum(dim=1)
-                else:
-                    prompt_token_lengths = torch.full((batch_size,), prompt_width, dtype=torch.long, device=device)
-                completion_lengths = self._get_completion_lengths(generated_tokens, prompt_width)
-                new_attention_mask, new_labels = self._build_sequence_batch(
-                    generated_tokens, prompt_width, prompt_token_lengths, completion_lengths
+                    prompt_tokens = prompt_tokens[prompt_mask[idx].bool()]
+                elif pad_token_id is not None:
+                    prompt_tokens = prompt_tokens[prompt_tokens != pad_token_id]
+                prompt_texts.append(self.processing_class.decode(prompt_tokens.tolist(), skip_special_tokens=False))
+                length = prompt_width
+                completion_length = int(completion_lengths[idx].item())
+                completion_texts.append(
+                    self.processing_class.decode(
+                        generated_tokens[idx, length : length + completion_length].tolist(),
+                        skip_special_tokens=False,
+                    )
                 )
 
-                # Decode for logging
-                prompt_texts = []
-                completion_texts = []
-                for idx in range(batch_size):
-                    prompt_tokens = slice_inputs["prompts"][idx]
-                    if prompt_mask is not None:
-                        prompt_tokens = prompt_tokens[prompt_mask[idx].bool()]
-                    elif pad_token_id is not None:
-                        prompt_tokens = prompt_tokens[prompt_tokens != pad_token_id]
-                    prompt_texts.append(
-                        self.processing_class.decode(prompt_tokens.tolist(), skip_special_tokens=False)
-                    )
-                    length = prompt_width
-                    completion_length = int(completion_lengths[idx].item())
-                    completion_texts.append(
-                        self.processing_class.decode(
-                            generated_tokens[idx, length : length + completion_length].tolist(),
-                            skip_special_tokens=False,
-                        )
-                    )
-
+            start = 0
+            for slice_idx, slice_batch_size in zip(on_policy_indices, slice_batch_sizes, strict=True):
+                end = start + slice_batch_size
+                slice_inputs = slices[slice_idx]
                 updated = dict(slice_inputs)
-                updated["input_ids"] = generated_tokens
-                updated["attention_mask"] = new_attention_mask
-                updated["labels"] = new_labels
+                updated["input_ids"] = generated_tokens[start:end]
+                updated["attention_mask"] = new_attention_mask[start:end]
+                updated["labels"] = new_labels[start:end]
 
                 self._buffered_inputs[slice_idx] = updated
-                self._buffered_text_logs[slice_idx] = (prompt_texts, completion_texts)
+                self._buffered_text_logs[slice_idx] = (prompt_texts[start:end], completion_texts[start:end])
+                start = end
 
     def _store_completions_in_buffer(
         self,

@@ -14,6 +14,8 @@
 
 import math
 import os
+from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -620,3 +622,66 @@ def test_repeat_batch_dataloader_delegates_set_epoch_via_getattr():
     wrapper.set_epoch(7)
 
     assert dataloader.epoch == 7
+
+
+def test_generate_with_model_batches_all_on_policy_slices(monkeypatch):
+    from trl.experimental.distillation import distillation_trainer as distillation_trainer_module
+
+    trainer = DistillationTrainer.__new__(DistillationTrainer)
+    trainer.model = object()
+    trainer.accelerator = object()
+    trainer.generation_kwargs = {}
+    trainer.generation_config = SimpleNamespace()
+    trainer.processing_class = SimpleNamespace(
+        pad_token_id=0,
+        decode=lambda token_ids, skip_special_tokens=False: " ".join(str(token_id) for token_id in token_ids),
+    )
+    trainer._buffered_inputs = [None, None]
+    trainer._buffered_text_logs = [None, None]
+
+    slices = [
+        {
+            "prompts": torch.tensor([[0, 11, 12], [0, 13, 14]], dtype=torch.long),
+            "prompt_attention_mask": torch.tensor([[0, 1, 1], [0, 1, 1]], dtype=torch.long),
+        },
+        {
+            "prompts": torch.tensor([[0, 21, 22], [0, 23, 24]], dtype=torch.long),
+            "prompt_attention_mask": torch.tensor([[0, 1, 1], [0, 1, 1]], dtype=torch.long),
+        },
+    ]
+
+    class DummyModel:
+        def __init__(self):
+            self.calls = []
+
+        def generate(self, input_ids, attention_mask, generation_config, return_dict_in_generate):
+            self.calls.append((input_ids.clone(), attention_mask.clone()))
+            completion_tokens = torch.tensor([[31, 32], [33, 34], [35, 36], [37, 38]], dtype=input_ids.dtype)
+            return SimpleNamespace(sequences=torch.cat([input_ids, completion_tokens], dim=1))
+
+    dummy_model = DummyModel()
+
+    @contextmanager
+    def fake_unwrap_model_for_generation(model, accelerator, generation_kwargs):
+        yield dummy_model
+
+    monkeypatch.setattr(
+        distillation_trainer_module, "unwrap_model_for_generation", fake_unwrap_model_for_generation
+    )
+
+    trainer._generate_with_model(slices, [0, 1])
+
+    assert len(dummy_model.calls) == 1
+    called_input_ids, called_attention_mask = dummy_model.calls[0]
+    expected_prompts = torch.cat([slices[0]["prompts"], slices[1]["prompts"]], dim=0)
+    expected_prompt_mask = torch.cat(
+        [slices[0]["prompt_attention_mask"], slices[1]["prompt_attention_mask"]],
+        dim=0,
+    )
+    torch.testing.assert_close(called_input_ids, expected_prompts)
+    torch.testing.assert_close(called_attention_mask, expected_prompt_mask)
+
+    assert trainer._buffered_inputs[0]["input_ids"].shape[0] == 2
+    assert trainer._buffered_inputs[1]["input_ids"].shape[0] == 2
+    torch.testing.assert_close(trainer._buffered_inputs[0]["input_ids"][:, -2:], torch.tensor([[31, 32], [33, 34]]))
+    torch.testing.assert_close(trainer._buffered_inputs[1]["input_ids"][:, -2:], torch.tensor([[35, 36], [37, 38]]))

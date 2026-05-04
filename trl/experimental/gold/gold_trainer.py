@@ -1201,30 +1201,41 @@ class GOLDTrainer(SFTTrainer):
 
     def _generate_non_vllm_for_slices(self, slices: list[dict[str, torch.Tensor | Any]], on_policy_indices: list[int]):
         """Fallback generation without vLLM (uses model.generate per slice)."""
+        prompt_batches = [slices[slice_idx]["prompts"] for slice_idx in on_policy_indices]
+        slice_batch_sizes = [prompt_batch.shape[0] for prompt_batch in prompt_batches]
+        combined_inputs = {"prompts": torch.cat(prompt_batches, dim=0)}
+
+        prompt_mask_batches = [slices[slice_idx].get("prompt_attention_mask") for slice_idx in on_policy_indices]
+        if prompt_mask_batches[0] is not None:
+            combined_inputs["prompt_attention_mask"] = torch.cat(prompt_mask_batches, dim=0)
+
         with unwrap_model_for_generation(
             self.model,
             self.accelerator,
             generation_kwargs=self.generation_kwargs,
         ) as unwrapped_model:
-            for slice_idx in on_policy_indices:
-                slice_inputs = slices[slice_idx]
-                result = self.generate_on_policy_outputs(
-                    unwrapped_model,
-                    slice_inputs,
-                    self.generation_config,
-                    self.processing_class.pad_token_id,
-                )
-                new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = result
+            result = self.generate_on_policy_outputs(
+                unwrapped_model,
+                combined_inputs,
+                self.generation_config,
+                self.processing_class.pad_token_id,
+            )
+            new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = result
 
+            start = 0
+            for slice_idx, slice_batch_size in zip(on_policy_indices, slice_batch_sizes, strict=True):
+                end = start + slice_batch_size
+                slice_inputs = slices[slice_idx]
                 updated_slice = dict(slice_inputs)
-                updated_slice["input_ids"] = new_input_ids
-                updated_slice["attention_mask"] = new_attention_mask
-                updated_slice["labels"] = new_labels
-                updated_slice["original_prompt_text"] = prompt_texts
-                updated_slice["original_completion_text"] = completion_texts
+                updated_slice["input_ids"] = new_input_ids[start:end]
+                updated_slice["attention_mask"] = new_attention_mask[start:end]
+                updated_slice["labels"] = new_labels[start:end]
+                updated_slice["original_prompt_text"] = prompt_texts[start:end]
+                updated_slice["original_completion_text"] = completion_texts[start:end]
 
                 self._buffered_inputs[slice_idx] = updated_slice
-                self._buffered_text_logs[slice_idx] = (prompt_texts, completion_texts)
+                self._buffered_text_logs[slice_idx] = (prompt_texts[start:end], completion_texts[start:end])
+                start = end
 
     def _process_completions_to_buffer(
         self,
