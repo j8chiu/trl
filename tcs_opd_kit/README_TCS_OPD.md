@@ -39,6 +39,7 @@ The default config is designed for **4 × RTX 3090 24GB**:
 - `gradient_accumulation_steps=4`
 - `max_length=768`
 - `max_completion_length=384`
+- student rollout via colocated vLLM by default in `scripts/train_one.sh`
 - sparse top-k loss with `loss_top_k=32` and tail bucket
 
 ## Sanity run
@@ -51,6 +52,12 @@ export MAX_TRAIN_SAMPLES=512
 export MAX_STEPS=50
 bash scripts/train_one.sh tcs 42
 bash scripts/eval_one.sh outputs/pilot/tcs_seed42
+```
+
+To disable vLLM for rollout generation and fall back to `transformers.generate()`:
+
+```bash
+export USE_VLLM=false
 ```
 
 ## First pilot matrix

@@ -22,6 +22,12 @@ LR=${LR:-2e-4}
 GAS=${GAS:-4}
 BSZ=${BSZ:-1}
 OUT_ROOT=${OUT_ROOT:-outputs/pilot}
+USE_VLLM=${USE_VLLM:-true}
+VLLM_MODE=${VLLM_MODE:-colocate}
+VLLM_TP_SIZE=${VLLM_TP_SIZE:-1}
+VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.3}
+VLLM_SYNC_FREQUENCY=${VLLM_SYNC_FREQUENCY:-10}
+VLLM_MAX_MODEL_LENGTH=${VLLM_MAX_MODEL_LENGTH:-${MAX_LENGTH}}
 
 OUT_DIR=${OUT_ROOT}/${VARIANT}_seed${SEED}
 mkdir -p "${OUT_DIR}"
@@ -74,6 +80,17 @@ COMMON_ARGS=(
   --num_completions_to_print 4
   --report_to none
 )
+
+if [[ "${USE_VLLM}" == "true" ]]; then
+  COMMON_ARGS+=(
+    --use_vllm true
+    --vllm_mode "${VLLM_MODE}"
+    --vllm_tensor_parallel_size "${VLLM_TP_SIZE}"
+    --vllm_gpu_memory_utilization "${VLLM_GPU_MEMORY_UTILIZATION}"
+    --vllm_sync_frequency "${VLLM_SYNC_FREQUENCY}"
+    --vllm_max_model_length "${VLLM_MAX_MODEL_LENGTH}"
+  )
+fi
 
 # The vanilla OPD baseline should call TRL's original loss path.
 if [[ "${VARIANT}" == "off" || "${VARIANT}" == "vanilla" ]]; then
