@@ -150,3 +150,7 @@ uv.lock
 # AI agent generated artifacts
 /.agents/skills
 /.claude/skills
+
+
+# Ignore the entire outputs directory
+outputs/
